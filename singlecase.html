@@ -1,0 +1,497 @@
+<!DOCTYPE html>
+<html lang="ja">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>ABグラフ（Tau-U / NAP / p値・手入力対応版）</title>
+  <script src="https://cdn.jsdelivr.net/npm/chart.js"></script>
+  <style>
+    body { font-family: system-ui, -apple-system, "Segoe UI", Roboto, sans-serif; margin: 24px; }
+    #container { max-width: 980px; margin: auto; }
+    h2 { margin-bottom: 8px; }
+    .meta { margin: 8px 0 18px; font-size: 0.95rem; }
+    .pill {
+      display:inline-block;
+      padding:4px 10px;
+      border:1px solid #ddd;
+      border-radius:999px;
+      margin-right:6px;
+      margin-bottom:6px;
+      background:#fafafa;
+    }
+    canvas { width: 100% !important; height: 420px !important; }
+
+    .form-row { margin-bottom: 12px; }
+    .form-row label { font-size: 0.9rem; display:block; margin-bottom:4px; }
+    textarea {
+      width: 100%;
+      min-height: 60px;
+      font-family: inherit;
+      font-size: 0.95rem;
+      padding: 6px 8px;
+      box-sizing: border-box;
+    }
+    .inline-row {
+      display:flex;
+      flex-wrap:wrap;
+      gap:16px;
+      align-items:center;
+      margin: 8px 0 12px;
+      font-size:0.95rem;
+    }
+    select {
+      font-size:0.95rem;
+      padding:6px 8px;
+    }
+    button {
+      font-size:0.95rem;
+      padding:8px 18px;
+      cursor:pointer;
+    }
+    .error {
+      color:#b00020;
+      font-size:0.9rem;
+      margin-top:6px;
+      white-space:pre-wrap;
+    }
+    .note {
+      font-size:0.88rem;
+      color:#444;
+      margin-top: 8px;
+      line-height: 1.45;
+    }
+    footer {
+      margin-top: 28px;
+      padding-top: 14px;
+      border-top: 1px solid #eee;
+      color:#333;
+      font-size:0.95rem;
+    }
+  </style>
+</head>
+<body>
+<div id="container">
+  <h2>AB効果可視化（入力対応・Tau-U / NAP / p値表示）</h2>
+
+  <div id="input-form">
+    <div class="form-row">
+      <label for="inputA">A期データ（ベースライン） 例 9, 8.5, 8, 7.2, 9</label>
+      <textarea id="inputA">9, 8, 8, 7, 9</textarea>
+    </div>
+
+    <div class="form-row">
+      <label for="inputB">B期データ（介入期） 例 6, 5.5, 5, 4.2, 3</label>
+      <textarea id="inputB">6, 5, 5, 4, 3, 4, 3, 2</textarea>
+    </div>
+
+    <div class="inline-row">
+      <span>改善方向</span>
+      <select id="directionSelect">
+        <option value="decrease">小さいほど良い（誤反応数・所要時間など）</option>
+        <option value="increase">大きいほど良い（得点・正答率など）</option>
+      </select>
+
+      <button id="updateButton">グラフと指標を更新</button>
+    </div>
+
+    <div class="note">
+      p値はMann-Whitney U（順位和検定）の正規近似で算出（タイ補正と連続性補正あり）。
+      サンプルが極端に小さい場合やタイが多い場合は近似精度が落ちる可能性がある。
+    </div>
+
+    <div id="errorMsg" class="error"></div>
+  </div>
+
+  <div class="meta">
+    <span class="pill" id="pillDirection"></span>
+    <span class="pill" id="pillCounts"></span>
+    <span class="pill" id="pillP"></span>
+  </div>
+
+  <canvas id="abChart"></canvas>
+
+  <p class="meta" id="stats"></p>
+
+  <footer>
+    この指標はあくまで参考数値です。必ず正式版を用いて確認するようにしてください
+  </footer>
+</div>
+
+<script>
+  // 初期値
+  let baselineData = [9, 8, 8, 7, 9];
+  let interventionData = [6, 5, 5, 4, 3, 4, 3, 2];
+  let improvementDirection = "decrease";
+
+  // 計算結果
+  let nap = NaN;
+  let tauU = NaN;
+  let pTwoSided = NaN;
+  let pOneSidedImprove = NaN;
+  let zValue = NaN;
+
+  // 全角などの正規化（小数許可を明確化）
+  function normalizeNumericText(s) {
+    if (typeof s !== "string") return "";
+
+    // 全角数字 -> 半角
+    s = s.replace(/[０-９]/g, (ch) => {
+      return String.fromCharCode(ch.charCodeAt(0) - 0xFF10 + 0x30);
+    });
+
+    // 全角記号など
+    s = s.replace(/，/g, ",")
+         .replace(/．/g, ".")
+         .replace(/－/g, "-")
+         .replace(/＋/g, "+")
+         .replace(/　/g, " ");
+
+    return s;
+  }
+
+  // 文字列入力を数値配列に変換（小数、指数表記、負数を許容）
+  function parseNumberList(text) {
+    const normalized = normalizeNumericText(text);
+    const tokens = normalized.split(/[,、\s]+/).map(v => v.trim()).filter(v => v.length > 0);
+
+    const nums = [];
+    const bad = [];
+
+    for (const t of tokens) {
+      const n = Number(t);
+      if (Number.isFinite(n)) nums.push(n);
+      else bad.push(t);
+    }
+
+    return { nums, bad };
+  }
+
+  // A-Bのペア比較（改善方向で勝ち負け定義）
+  function pairwiseCounts(A, B, direction) {
+    let wins = 0, losses = 0, ties = 0, total = 0;
+
+    for (const a of A) for (const b of B) {
+      total++;
+      if (direction === "increase") {
+        if (b > a) wins++;
+        else if (b < a) losses++;
+        else ties++;
+      } else {
+        if (b < a) wins++;
+        else if (b > a) losses++;
+        else ties++;
+      }
+    }
+    return { wins, losses, ties, total };
+  }
+
+  // NAP
+  function computeNAP(A, B, direction) {
+    const c = pairwiseCounts(A, B, direction);
+    if (c.total === 0) return NaN;
+    return (c.wins + 0.5 * c.ties) / c.total;
+  }
+
+  // Tau-U（非重なり成分、トレンド補正なし）
+  function computeTauU(A, B, direction) {
+    const c = pairwiseCounts(A, B, direction);
+    if (c.total === 0) return NaN;
+    return (c.wins - c.losses) / c.total;
+  }
+
+  // erf 近似
+  function erf(x) {
+    const sign = Math.sign(x) || 1;
+    const ax = Math.abs(x);
+
+    // Abramowitz and Stegun 7.1.26
+    const p = 0.3275911;
+    const a1 = 0.254829592;
+    const a2 = -0.284496736;
+    const a3 = 1.421413741;
+    const a4 = -1.453152027;
+    const a5 = 1.061405429;
+
+    const t = 1 / (1 + p * ax);
+    const y = 1 - (((((a5 * t + a4) * t + a3) * t + a2) * t + a1) * t) * Math.exp(-(ax * ax));
+
+    return sign * y;
+  }
+
+  function normalCDF(z) {
+    return 0.5 * (1 + erf(z / Math.SQRT2));
+  }
+
+  // Mann-Whitney U によるp値（正規近似、タイ補正、連続性補正）
+  // 改善方向に合わせて値を変換し、代替仮説は「BがAより大きい」に統一
+  function mannWhitneyP(A, B, direction) {
+    const nA = A.length;
+    const nB = B.length;
+    const N = nA + nB;
+
+    if (nA === 0 || nB === 0) return { pTwoSided: NaN, pOneSidedImprove: NaN, z: NaN };
+
+    const transform = (v) => direction === "increase" ? v : -v;
+
+    const all = [];
+    for (const a of A) all.push({ v: transform(a), g: "A" });
+    for (const b of B) all.push({ v: transform(b), g: "B" });
+
+    // ソート
+    all.sort((x, y) => (x.v < y.v ? -1 : (x.v > y.v ? 1 : 0)));
+
+    // ランク付け（平均順位）、タイ群サイズ収集
+    const ranks = new Array(N);
+    const tieSizes = [];
+
+    let i = 0;
+    while (i < N) {
+      let j = i;
+      while (j + 1 < N && all[j + 1].v === all[i].v) j++;
+
+      const rankStart = i + 1;     // 1-based
+      const rankEnd = j + 1;
+      const avgRank = (rankStart + rankEnd) / 2;
+
+      for (let k = i; k <= j; k++) ranks[k] = avgRank;
+
+      const t = j - i + 1;
+      if (t > 1) tieSizes.push(t);
+
+      i = j + 1;
+    }
+
+    // Bの順位和
+    let rankSumB = 0;
+    for (let idx = 0; idx < N; idx++) {
+      if (all[idx].g === "B") rankSumB += ranks[idx];
+    }
+
+    // U_B（Bが大きい方向の勝ち数に相当、タイは0.5）
+    const U = rankSumB - (nB * (nB + 1)) / 2;
+
+    const meanU = (nA * nB) / 2;
+
+    // タイ補正項
+    let tieTerm = 0;
+    for (const t of tieSizes) {
+      tieTerm += (t * t * t) - t; // t^3 - t（指数演算子は使わない）
+    }
+
+    // 分散
+    // Var(U) = nA*nB/12 * ( (N+1) - tieTerm/(N*(N-1)) )
+    const denom = N * (N - 1);
+    const tieCorrection = denom > 0 ? (tieTerm / denom) : 0;
+    const varU = (nA * nB / 12) * ((N + 1) - tieCorrection);
+
+    if (!(varU > 0)) return { pTwoSided: NaN, pOneSidedImprove: NaN, z: NaN };
+
+    const sdU = Math.sqrt(varU);
+
+    // 連続性補正
+    const cc = 0.5 * (Math.sign(U - meanU) || 0);
+    const z = (U - meanU - cc) / sdU;
+
+    const p2 = 2 * (1 - normalCDF(Math.abs(z)));
+    const p1 = 1 - normalCDF(z); // 代替仮説: B > A（改善方向に合わせ済み）
+
+    return { pTwoSided: p2, pOneSidedImprove: p1, z: z };
+  }
+
+  function magnitudeLabelNap(v) {
+    if (!Number.isFinite(v)) return "解釈不能";
+    if (v >= 0.93) return "大";
+    if (v >= 0.66) return "中";
+    return "小";
+  }
+
+  function magnitudeLabelTauU(v) {
+    if (!Number.isFinite(v)) return "解釈不能";
+    const av = Math.abs(v);
+    if (av >= 0.90) return "大";
+    if (av >= 0.66) return "中";
+    return "小";
+  }
+
+  function fmtP(p) {
+    if (!Number.isFinite(p)) return "NaN";
+    if (p < 0.0001) return "<0.0001";
+    return p.toFixed(4);
+  }
+
+  function buildLabels() {
+    const labelsA = baselineData.map((_, i) => "A" + (i + 1));
+    const labelsB = interventionData.map((_, i) => "B" + (i + 1));
+    return labelsA.concat(labelsB);
+  }
+
+  function buildSeriesA() {
+    return baselineData.concat(new Array(interventionData.length).fill(null));
+  }
+
+  function buildSeriesB() {
+    return new Array(baselineData.length).fill(null).concat(interventionData);
+  }
+
+  function recalcStats() {
+    nap = computeNAP(baselineData, interventionData, improvementDirection);
+    tauU = computeTauU(baselineData, interventionData, improvementDirection);
+
+    const p = mannWhitneyP(baselineData, interventionData, improvementDirection);
+    pTwoSided = p.pTwoSided;
+    pOneSidedImprove = p.pOneSidedImprove;
+    zValue = p.z;
+  }
+
+  // A-B境界線
+  const phaseDivider = {
+    id: "phaseDivider",
+    afterDraw(chart) {
+      const { ctx, chartArea, scales } = chart;
+      if (!baselineData || baselineData.length === 0) return;
+      if (!interventionData || interventionData.length === 0) return;
+
+      const idxAEnd = baselineData.length - 1;
+      const idxBStart = baselineData.length;
+
+      const x1 = scales.x.getPixelForTick(idxAEnd);
+      const x2 = scales.x.getPixelForTick(idxBStart);
+      if (!Number.isFinite(x1) || !Number.isFinite(x2)) return;
+
+      const x = (x1 + x2) / 2;
+
+      ctx.save();
+      ctx.beginPath();
+      ctx.moveTo(x, chartArea.top);
+      ctx.lineTo(x, chartArea.bottom);
+      ctx.lineWidth = 2;
+      ctx.setLineDash([6, 6]);
+      ctx.strokeStyle = "#666";
+      ctx.stroke();
+      ctx.fillStyle = "#666";
+      ctx.fillText("A → B", x + 6, chartArea.top + 14);
+      ctx.restore();
+    }
+  };
+
+  // 初回計算
+  recalcStats();
+
+  const ctx = document.getElementById("abChart").getContext("2d");
+
+  const chart = new Chart(ctx, {
+    type: "line",
+    data: {
+      labels: buildLabels(),
+      datasets: [
+        {
+          label: "A期（ベースライン）",
+          data: buildSeriesA(),
+          spanGaps: true,
+          pointRadius: 4,
+          tension: 0.2
+        },
+        {
+          label: "B期（介入）",
+          data: buildSeriesB(),
+          spanGaps: true,
+          pointRadius: 4,
+          tension: 0.2
+        }
+      ]
+    },
+    options: {
+      responsive: true,
+      plugins: {
+        tooltip: {
+          enabled: true,
+          callbacks: {
+            afterBody: () => [
+              "Tau-U: " + (Number.isFinite(tauU) ? tauU.toFixed(3) : "NaN"),
+              "NAP: " + (Number.isFinite(nap) ? nap.toFixed(3) : "NaN"),
+              "p(two-sided)≈ " + fmtP(pTwoSided),
+              "p(one-sided, improve)≈ " + fmtP(pOneSidedImprove)
+            ]
+          }
+        },
+        legend: { position: "top" },
+        title: {
+          display: true,
+          text: "ABデザイン 指標推移と非重なり統計"
+        }
+      },
+      scales: {
+        y: { title: { display: true, text: "指標値" } },
+        x: { title: { display: true, text: "セッション" } }
+      }
+    },
+    plugins: [phaseDivider]
+  });
+
+  function updateMetaText() {
+    const pillDirection = document.getElementById("pillDirection");
+    const pillCounts = document.getElementById("pillCounts");
+    const pillP = document.getElementById("pillP");
+    const statsP = document.getElementById("stats");
+
+    pillDirection.textContent =
+      "改善方向: " + (improvementDirection === "increase" ? "大きいほど良い" : "小さいほど良い");
+
+    pillCounts.textContent =
+      "A期: " + baselineData.length + " 点, B期: " + interventionData.length + " 点";
+
+    pillP.textContent =
+      "p(two-sided)≈ " + fmtP(pTwoSided) + " / p(one-sided)≈ " + fmtP(pOneSidedImprove);
+
+    const tauLabel = magnitudeLabelTauU(tauU);
+    const napLabel = magnitudeLabelNap(nap);
+
+    const tauStr = Number.isFinite(tauU) ? tauU.toFixed(3) : "NaN";
+    const napStr = Number.isFinite(nap) ? nap.toFixed(3) : "NaN";
+    const zStr = Number.isFinite(zValue) ? zValue.toFixed(3) : "NaN";
+
+    statsP.textContent =
+      "Tau-U = " + tauStr + "（" + tauLabel + "） / " +
+      "NAP = " + napStr + "（" + napLabel + "） / " +
+      "z≈ " + zStr + " / " +
+      "p(two-sided)≈ " + fmtP(pTwoSided) + " / " +
+      "p(one-sided, improve)≈ " + fmtP(pOneSidedImprove);
+  }
+
+  updateMetaText();
+
+  document.getElementById("updateButton").addEventListener("click", () => {
+    const inputA = document.getElementById("inputA").value;
+    const inputB = document.getElementById("inputB").value;
+    const dirSelect = document.getElementById("directionSelect");
+    const errorMsg = document.getElementById("errorMsg");
+
+    const parsedA = parseNumberList(inputA);
+    const parsedB = parseNumberList(inputB);
+
+    const warnings = [];
+    if (parsedA.bad.length > 0) warnings.push("A期で数値として解釈できないトークン: " + parsedA.bad.join(", "));
+    if (parsedB.bad.length > 0) warnings.push("B期で数値として解釈できないトークン: " + parsedB.bad.join(", "));
+
+    if (parsedA.nums.length === 0 || parsedB.nums.length === 0) {
+      errorMsg.textContent = "A期とB期の両方に少なくとも1つの数値が必要。\n" + warnings.join("\n");
+      return;
+    }
+
+    baselineData = parsedA.nums;
+    interventionData = parsedB.nums;
+    improvementDirection = dirSelect.value;
+
+    recalcStats();
+
+    chart.data.labels = buildLabels();
+    chart.data.datasets[0].data = buildSeriesA();
+    chart.data.datasets[1].data = buildSeriesB();
+    chart.update();
+
+    errorMsg.textContent = warnings.length > 0 ? warnings.join("\n") : "";
+    updateMetaText();
+  });
+</script>
+</body>
+</html>
